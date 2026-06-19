@@ -58,6 +58,19 @@ def main_menu_buttons():
         [Button.inline("📨 Рассылка", data="menu_send")],
     ]
 
+def code_keyboard(current: str = "") -> list:
+    """Цифровая клавиатура для ввода кода."""
+    display = current if current else "_ _ _ _ _"
+    rows = [
+        [Button.inline(f"📟 Код: {display}", data="noop")],
+        [Button.inline("1", data="cd_1"), Button.inline("2", data="cd_2"), Button.inline("3", data="cd_3")],
+        [Button.inline("4", data="cd_4"), Button.inline("5", data="cd_5"), Button.inline("6", data="cd_6")],
+        [Button.inline("7", data="cd_7"), Button.inline("8", data="cd_8"), Button.inline("9", data="cd_9")],
+        [Button.inline("⌫", data="cd_back"), Button.inline("0", data="cd_0"), Button.inline("✅ Готово", data="cd_ok")],
+        [Button.inline("❌ Отмена", data="cancel")],
+    ]
+    return rows
+
 
 # ═══ КОМАНДЫ ════════════════════════════════════════════════════
 
@@ -70,7 +83,13 @@ async def cmd_start(event):
 @bot.on(events.NewMessage(pattern="/cancel"))
 async def cmd_cancel(event):
     uid = event.sender_id
-    auth_sessions.pop(uid, None)
+    # disconnect pending client if any
+    session = auth_sessions.pop(uid, None)
+    if session and "client" in session:
+        try:
+            await session["client"].disconnect()
+        except:
+            pass
     broadcast_sessions.pop(uid, None)
     await event.respond("❌ Отменено.", buttons=main_menu_buttons())
 
@@ -85,6 +104,15 @@ async def callback_handler(event):
     if not is_admin(uid):
         return await event.answer("⛔ Нет доступа.", alert=True)
 
+    # ── цифровая клавиатура кода ─────────────────────────────────
+    if data == "noop":
+        return await event.answer()
+
+    if data.startswith("cd_"):
+        await handle_code_button(event, data[3:])
+        return
+
+    # ── основная навигация ───────────────────────────────────────
     if data == "menu_accounts":
         await show_accounts_menu(event)
 
@@ -95,7 +123,12 @@ async def callback_handler(event):
         await begin_add_account(event)
 
     elif data == "cancel":
-        auth_sessions.pop(uid, None)
+        session = auth_sessions.pop(uid, None)
+        if session and "client" in session:
+            try:
+                await session["client"].disconnect()
+            except:
+                pass
         broadcast_sessions.pop(uid, None)
         await event.edit("❌ Отменено.", buttons=main_menu_buttons())
 
@@ -120,6 +153,69 @@ async def callback_handler(event):
     elif data == "send_cancel":
         broadcast_sessions.pop(uid, None)
         await event.edit("❌ Рассылка отменена.", buttons=main_menu_buttons())
+
+
+async def handle_code_button(event, action: str):
+    uid = event.sender_id
+    session = auth_sessions.get(uid)
+    if not session or session.get("step") != "code":
+        return await event.answer("Сессия устарела.", alert=True)
+
+    current = session.get("code_input", "")
+
+    if action == "back":
+        current = current[:-1]
+    elif action == "ok":
+        if len(current) < 4:
+            return await event.answer("Слишком короткий код!", alert=True)
+        await event.answer()
+        await submit_code(event, uid, session, current)
+        return
+    elif action.isdigit():
+        if len(current) >= 6:
+            return await event.answer("Максимум 6 цифр", alert=True)
+        current += action
+
+    session["code_input"] = current
+    await event.answer()
+    try:
+        await event.edit(
+            f"📲 Код отправлен на `{session['phone']}`\nВводи цифры:",
+            buttons=code_keyboard(current),
+            parse_mode="md",
+        )
+    except:
+        pass
+
+
+async def submit_code(event, uid, session, code: str):
+    client = session["client"]
+    phone = session["phone"]
+    try:
+        await client.sign_in(phone, code, phone_code_hash=session["hash"])
+        await finish_auth(event, uid, phone, client)
+    except SessionPasswordNeededError:
+        session["step"] = "2fa"
+        session.pop("code_input", None)
+        await event.edit(
+            "🔐 Введи пароль двухфакторки:\n\n/cancel",
+            buttons=None,
+        )
+    except PhoneCodeExpiredError:
+        auth_sessions.pop(uid, None)
+        await client.disconnect()
+        await event.edit("❗ Код истёк. Начни заново /start", buttons=main_menu_buttons())
+    except PhoneCodeInvalidError:
+        session["code_input"] = ""
+        await event.edit(
+            f"❗ Неверный код! Попробуй ещё:\n\n📲 Код на `{phone}`",
+            buttons=code_keyboard(""),
+            parse_mode="md",
+        )
+    except Exception as e:
+        auth_sessions.pop(uid, None)
+        await client.disconnect()
+        await event.edit(f"❌ Ошибка: {e}", buttons=main_menu_buttons())
 
 
 # ═══ АККАУНТЫ ═══════════════════════════════════════════════════
@@ -304,7 +400,7 @@ async def do_broadcast(uid, msg, client, usernames, text):
         await bot.send_message(uid, f"✅ Готово! Успешно: {len(success)}, ошибок: {len(failed)}", buttons=main_menu_buttons())
 
 
-# ═══ ТЕКСТОВЫЕ СООБЩЕНИЯ (авторизация + шаги рассылки) ══════════
+# ═══ ТЕКСТОВЫЕ СООБЩЕНИЯ ════════════════════════════════════════
 
 @bot.on(events.NewMessage(incoming=True))
 async def message_handler(event):
@@ -315,11 +411,11 @@ async def message_handler(event):
         return
 
     if uid in auth_sessions:
-        await handle_auth(event)
+        await handle_auth_text(event)
     elif uid in broadcast_sessions:
         await handle_broadcast_input(event)
 
-async def handle_auth(event):
+async def handle_auth_text(event):
     uid = event.sender_id
     session = auth_sessions[uid]
     step = session["step"]
@@ -334,31 +430,25 @@ async def handle_auth(event):
         await client.connect()
         try:
             result = await client.send_code_request(phone)
-            session.update({"step": "code", "phone": phone, "client": client, "hash": result.phone_code_hash})
-            await event.respond(f"📲 Код отправлен на `{phone}`\nВведи код:\n\n/cancel", parse_mode="md")
+            session.update({
+                "step": "code",
+                "phone": phone,
+                "client": client,
+                "hash": result.phone_code_hash,
+                "code_input": "",
+            })
+            await event.respond(
+                f"📲 Код отправлен на `{phone}`\nВводи цифры:",
+                buttons=code_keyboard(""),
+                parse_mode="md",
+            )
         except FloodWaitError as e:
-            await client.disconnect(); auth_sessions.pop(uid)
+            await client.disconnect()
+            auth_sessions.pop(uid)
             await event.respond(f"⏳ Flood wait {e.seconds} сек.")
         except Exception as e:
-            await client.disconnect(); auth_sessions.pop(uid)
-            await event.respond(f"❌ Ошибка: {e}")
-
-    elif step == "code":
-        client = session["client"]
-        phone = session["phone"]
-        try:
-            await client.sign_in(phone, text.replace(" ", ""), phone_code_hash=session["hash"])
-            await finish_auth(event, uid, phone, client)
-        except SessionPasswordNeededError:
-            session["step"] = "2fa"
-            await event.respond("🔐 Введи пароль двухфакторки:\n\n/cancel")
-        except PhoneCodeExpiredError:
-            auth_sessions.pop(uid); await client.disconnect()
-            await event.respond("❗ Код истёк. Начни заново /start")
-        except PhoneCodeInvalidError:
-            await event.respond("❗ Неверный код, попробуй ещё:")
-        except Exception as e:
-            auth_sessions.pop(uid); await client.disconnect()
+            await client.disconnect()
+            auth_sessions.pop(uid)
             await event.respond(f"❌ Ошибка: {e}")
 
     elif step == "2fa":
@@ -368,7 +458,8 @@ async def handle_auth(event):
             await client.sign_in(password=text)
             await finish_auth(event, uid, phone, client)
         except Exception as e:
-            auth_sessions.pop(uid); await client.disconnect()
+            auth_sessions.pop(uid)
+            await client.disconnect()
             await event.respond(f"❌ Ошибка 2FA: {e}")
 
 async def finish_auth(event, uid, phone, client):
